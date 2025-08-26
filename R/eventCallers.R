@@ -275,7 +275,9 @@ fusions = function(graph = NULL,
                    annotate.graph = TRUE,  
                    mc.cores = 1,
                    verbose = FALSE,
-                   return.all.alt.edges = TRUE)
+                   return.all.alt.edges = TRUE,
+                   pick_longest_cds = TRUE,
+                   protein_coding_only = TRUE)
 {
   ## QC input graph or junctions
   if (!inherits(graph, "gGraph")){
@@ -315,8 +317,8 @@ fusions = function(graph = NULL,
 
   lst_out = list(fus = out, allaltedges.ann = allaltedges.ann)
 
-  # make_txgraph returns the txgraph and alledges
-  tx.lst = make_txgraph(graph, gencode)
+    # make_txgraph returns the txgraph and alledges
+  tx.lst = make_txgraph(graph, gencode, pick_longest_cds = pick_longest_cds, protein_coding_only = protein_coding_only, verbose = verbose)
   tgg = tx.lst$txgraph
 
   if (is.null(tgg)) return(if (return.all.alt.edges) lst_out else out)
@@ -505,7 +507,7 @@ fusions = function(graph = NULL,
   if (annotate.graph && length(gw)) {
     if (verbose) message('Annotating gGraph with GENCODE elements')
     ugene = unique(allp$nodes$dt$gene_name)
-    gt = gt.gencode(gencode %Q% (gene_name %in% ugene))
+    gt = gt.gencode(tx.lst$gencode_fusion %Q% (gene_name %in% ugene))
     annotations = dat(gt)[[1]]                      ## stored in gTrack
     gw$disjoin(gr = annotations)
     gw$set(name = gw$dt$genes)
@@ -544,22 +546,92 @@ fusions = function(graph = NULL,
 #' @author Marcin Imielinski
 #' @noRd
 #' @keywords internal
-make_txgraph = function(gg, gencode)
-  {
-    tx = gencode %Q% (type == 'transcript')
+make_txgraph = function(gg, gencode, pick_longest_cds = TRUE, protein_coding_only = TRUE, verbose = TRUE)
+{
 
-    ## broken transcripts intersect at least one junction
-    tx$in.break = tx %^% grbind(gg$loose, unlist(gg$edges[type == 'ALT']$junctions$grl))
+  if (pick_longest_cds) {
+    gencode_dt = gr2dt(gencode[, c("gene_name", "transcript_id", "type", "gene_type", "transcript_type")])
+    gencode_dt[, IX___TEMP := seq_len(.N)]
+    cds_rank = (
+      gencode_dt[
+        gencode_dt$type == "CDS"
+        ## & gencode_dt$gene_type == "protein_coding"
+        ## & gencode_dt$transcript_type == "protein_coding"
+      ]
+      [, .(sum(width), list(IX___TEMP)), by = .(gene_name, transcript_id)]
+    )
+
+    cds_rank[, rank := rank(-V1), by = gene_name]
     
-    if (!any(tx$in.break)){
-        warning("No breakpoint in any transcript.")
-        return(NULL)
-    }
+    gencode_dt = merge(gencode_dt, cds_rank[, .(transcript_id, tx_rank = rank)], by = "transcript_id", all.x= TRUE)
+    mcols(gencode)[gencode_dt$IX___TEMP, "tx_rank"] = gencode_dt$tx_rank
 
-    txb = tx[tx$in.break]
+  }
+  tx = gencode %Q% (type == 'transcript')
+
+  ## broken transcripts intersect at least one junction
+  altbps = gUtils::grl.unlist(gg$edges[type == 'ALT']$junctions$grl)
+  tx$in.break = tx %^% grbind(gg$loose, altbps)
+  
+  if (protein_coding_only) {
+    if (verbose) message("Picking protein coding only transcript")
+    tx = tx[
+      tx$gene_type == "protein_coding"
+      & tx$transcript_type == "protein_coding"
+    ]
+  }
+      
+  if (!any(tx$in.break)){
+    warning("No breakpoint in any transcript.")
+    return(NULL)
+  }
+
+  txb = tx[tx$in.break]
+  if (pick_longest_cds) {
+    ## per gene, pick the longest cds, but also account for all bp with a tx..
+    txbp_cross = txb %*% altbps    
+    txbp_accounting = (
+      gr2dt(txbp_cross)
+      [order(tx_rank), .SD[!duplicated(transcript_id)], by = .(grl.ix, grl.iix)] ## top ranked tx per breakpoint
+      [, .(tx_rank = tx_rank[1], lst = list(unique(paste(grl.ix, grl.iix, sep = "___")))), by = .(transcript_id, gene_name)] ## breakpoint keys
+    )
+    txbp_accounting$nbp = S4Vectors::elementNROWS(txbp_accounting$lst)
+    txbp_accounting = txbp_accounting[order(-nbp, tx_rank, transcript_id)]
+    
+    account_for_bp_by_tx = function(sdchunk, gene_name) {
+      ## print(gene_name)
+      ## if (gene_name == "RUNX1") browser()
+      sdchunk = sdchunk[order(-nbp)]
+      unionbp = unique(unlist(sdchunk$lst))
+      bp_key = character(0)
+      sdiff = setdiff(unionbp, bp_key)
+      are_bp_fully_accounted = length(sdiff) == 0
+      txids = character(0)
+      counter = 1
+      while (!are_bp_fully_accounted) {
+        row_item = sdchunk[counter,]
+        txids = c(txids, row_item$transcript_id)
+        bp_key = c(bp_key, unlist(row_item$lst))
+        sdiff = setdiff(unionbp, bp_key)
+        are_bp_fully_accounted = length(sdiff) == 0
+        counter = counter + 1
+      }
+      return(txids)
+    }
+    txids_to_keep = txbp_accounting[, .(transcript_id = account_for_bp_by_tx(.SD, gene_name)), by = gene_name]
+    
+
+    if (verbose) message("Picking transcript with longest CDS, while accounting for all breakpoint x transcript overlaps")
+    ## txb = txb[order(txb$tx_rank),]
+    ## txb = txb[!duplicated(txb$gene_name, fromLast = FALSE),]
+    txb = base::subset(txb, subset = txb$transcript_id %in% txids_to_keep$transcript_id)
+
+  }
+  gencode_fus = gencode %Q% (transcript_id %in% txb$transcript_id)
+  
 
     ## we sort all cds associated with broken transcripts using their stranded coordinate value
-    cds = gencode %Q% (type == 'CDS') %Q% (transcript_id %in% txb$transcript_id)
+    cds = gencode_fus %Q% (type == 'CDS') 
 
     ## remove any transcripts that lack a CDS (yes these exist)
     txb = txb %Q% (transcript_id %in% cds$transcript_id)
@@ -683,11 +755,13 @@ make_txgraph = function(gg, gencode)
     ## Logic: CDS are a subset of all exons
     ## thus, exons that don't overlap with a cds are in UTR
     by_field = "transcript_id"
-    exons = gencode %Q% (type == "exon") %Q% (transcript_id %in% txb$transcript_id)
+    exons = gencode_fus %Q% (type == "exon") %Q% (transcript_id %in% txb$transcript_id)
     exons$exon_number = as.numeric(exons$exon_number)
 
-    utrs = gencode %Q% (grepl("UTR", type)) %Q% (transcript_id %in% txb$transcript_id)
-    
+    ## creating exon superset
+    exonic = cds
+
+    utrs = gencode_fus %Q% (grepl("UTR", type)) %Q% (transcript_id %in% txb$transcript_id)
     ## Annotating 5p and 3p UTRs
     ## This isn't directly annotated, so need to infer
     ## Below we are building a disjoined union GRanges of transcripts
@@ -703,54 +777,59 @@ make_txgraph = function(gg, gencode)
     cds_footprint_by_tx = range(gUtils::gr_construct_by(cds, "transcript_id"))
     cds_footprint_by_tx$in_cds = TRUE
 
-    union_utr_txb = GenomicRanges::disjoin(c(utrs_by_tx[,c()], txb_by_tx[, c()]))
-    union_utr_txb$utr = setkey(
-      gr2dt(
-        gr.findoverlaps(
-          union_utr_txb, 
-          utrs_by_tx,
-          scol = "type")
-    ), query.id)[list(1:NROW(union_utr_txb))]$type
-    union_utr_txb$transcript_id = setkey(
-      gr2dt(
-        gr.findoverlaps(
-          union_utr_txb, txb_by_tx, 
-          scol = "transcript_id"
-      )
-    ), query.id)[list(1:NROW(union_utr_txb))]$transcript_id
-    union_utr_txb$in_cds = setkey(
-      gr2dt(
-        gr.findoverlaps(
-          union_utr_txb, cds_footprint_by_tx, scol = "in_cds")
-    ), query.id)[list(1:NROW(union_utr_txb))]$in_cds
-    union_utr_txb = union_utr_txb %Q% (order(ifelse(strand == "+", 1, -1) * start))
-    uniondt = gr2dt(union_utr_txb)
-    uniondt[, tx_iix := 1:.N, by = transcript_id]
-    uniondt[, utr_iix := label.runs(!is.na(utr)), by = transcript_id]
-    uniondt[, cds_run := label.runs(is.na(in_cds)), by = transcript_id]
-    uniondt[, is_utr := !is.na(utr)]
-    uniondt[, `:=`(
-        is_5p_utr = is_utr & cds_run == 1,
-        is_3p_utr = is_utr & cds_run == 2
-    ),  by = transcript_id]
+    utrexons = GRanges()
+    
+    need_to_annotate_utr_fivep_or_threep = NROW(utrs_by_tx) > 0
 
-    annotatedutrs_by_tx = dt2gr(uniondt[!is.na(utr)])
+    if (need_to_annotate_utr_fivep_or_threep) {
 
-    utrexons = gr.findoverlaps(
-      gUtils::gr_construct_by(exons, by_field), 
-      annotatedutrs_by_tx, 
-      qcol = names(mcols(exons)), 
-      scol = c("is_5p_utr", "is_3p_utr", "is_utr"),
-      ignore.strand = FALSE
-    )
-    utrexons = gr_deconstruct_by(utrexons, by_field)
+        union_utr_txb = GenomicRanges::disjoin(c(utrs_by_tx[,c()], txb_by_tx[, c()]))    
+        union_utr_txb$utr = setkey(
+            gr2dt(
+                gr.findoverlaps(
+                    union_utr_txb,
+                    utrs_by_tx,
+                    scol = "type")
+            ), query.id)[list(1:NROW(union_utr_txb))]$type
+        union_utr_txb$transcript_id = setkey(
+            gr2dt(
+                gr.findoverlaps(
+                    union_utr_txb, txb_by_tx, 
+                    scol = "transcript_id"
+                )
+            ), query.id)[list(1:NROW(union_utr_txb))]$transcript_id
+        union_utr_txb$in_cds = setkey(
+            gr2dt(
+                gr.findoverlaps(
+                    union_utr_txb, cds_footprint_by_tx, scol = "in_cds")
+            ), query.id)[list(1:NROW(union_utr_txb))]$in_cds
+        union_utr_txb = union_utr_txb %Q% (order(ifelse(strand == "+", 1, -1) * start))
+        uniondt = gr2dt(union_utr_txb)
+        uniondt[, tx_iix := 1:.N, by = transcript_id]
+        uniondt[, utr_iix := label.runs(!is.na(utr)), by = transcript_id]
+        uniondt[, cds_run := label.runs(is.na(in_cds)), by = transcript_id]
+        uniondt[, is_utr := !is.na(utr)]
+        uniondt[, `:=`(
+            is_5p_utr = is_utr & cds_run == 1,
+            is_3p_utr = is_utr & cds_run == 2
+        ),  by = transcript_id]
 
-    ## creating exon superset
-    exonic = cds
-    if (length(utrexons)) {
-      utrexons$query.id = NULL
-      utrexons$subject.id = NULL
-      exonic = gUtils::grbind(exonic, utrexons)
+        annotatedutrs_by_tx = dt2gr(uniondt[!is.na(utr)])
+
+        utrexons = gr.findoverlaps(
+            gUtils::gr_construct_by(exons, by_field), 
+            annotatedutrs_by_tx, 
+            qcol = names(mcols(exons)), 
+            scol = c("is_5p_utr", "is_3p_utr", "is_utr"),
+            ignore.strand = FALSE
+        )
+        utrexons = gr_deconstruct_by(utrexons, by_field)
+        
+        if (length(utrexons)) {
+            utrexons$query.id = NULL
+            utrexons$subject.id = NULL
+            exonic = gUtils::grbind(exonic, utrexons)
+        }
     }
 
     exonic = exonic %Q% order(ifelse(strand == '+', 1, -1)*start)
@@ -761,7 +840,6 @@ make_txgraph = function(gg, gencode)
     # ## If below is not true, there is a problem to debug
 
     exonic_by_tx = gUtils::gr_construct_by(exonic, "transcript_id")
-
     overlaps = gr2dt(gr.findoverlaps(exonic_by_tx, exonic_by_tx, ignore.strand = FALSE))
     is_exonic_territory_overlapping = any(overlaps$query.id != overlaps$subject.id)
     if (is_exonic_territory_overlapping) {
@@ -998,7 +1076,12 @@ make_txgraph = function(gg, gencode)
 
     edge_metadata_colnames = names(edges)
     ## We need bp1 and bp2 strings in the edge metadata downstream
-    if (!all(c("bp1", "bp2") %in% edge_metadata_colnames)) {
+    do_reannotate_bp1bp2 = (
+        any(!c("bp1", "bp2") %in% edge_metadata_colnames)
+        || any(is.na(edges$bp1))
+        || any(is.na(edges$bp2))
+    )
+    if (do_reannotate_bp1bp2) {
       edges$bp1 = gUtils::gr.string(gg$edges$junctions$left[,c()])
       edges$bp2 = gUtils::gr.string(gg$edges$junctions$right[,c()])
     }
@@ -1021,8 +1104,6 @@ make_txgraph = function(gg, gencode)
     rm(introns_by_tx)
     rm(bp1)
     rm(bp2)
-
-    # browser()
 
     ## Merging and keeping all edges to cache for marking 5p and 3p exons per junction
     newedges = alledges[!is.na(new.node.id.x) & !is.na(new.node.id.y),]
@@ -1127,7 +1208,10 @@ make_txgraph = function(gg, gencode)
 
     ## just remove anti-sense and dead end edges
     ## (note: won't make our graph immune to these anti-sense paths via bridge nodes, see below)
-    newedges = newedges[-which(deadend | deadstart | antisense | splicevar), ] 
+  ## newedges = newedges[-which(deadend | deadstart | antisense | splicevar), ]
+  negative_ix_remove = newedges[, -which(deadend | deadstart | antisense | splicevar)]
+  any_edges_to_remove = NROW(negative_ix_remove) > 0
+  if (any_edges_to_remove) newedges = newedges[negative_ix_remove]
 
     ## weigh edge
     ## (1) REF edges weigh = 1
@@ -1162,7 +1246,8 @@ make_txgraph = function(gg, gencode)
 
     out = list(
       txgraph = tgg,
-      alledges = alledges
+      alledges = alledges,
+      gencode_fusion = gencode_fus
     )
 
     return(out)
@@ -1233,23 +1318,28 @@ get_txpaths = function(tgg,
         
         ab.p = gW(graph = tgg)
         if (NROW(paths) > 0) {
-          list_of_cn = paths$eval(
-            edge = {
-              alt_edge_cn = cn[type == "ALT"]
-              min_val = NA_real_
-              max_val = NA_real_
-              if (length(alt_edge_cn) > 0) {
-                min_val = min(alt_edge_cn, na.rm = TRUE)
-                max_val = max(alt_edge_cn, na.rm = TRUE)
+          paths_cn_field = paths$edges$dt$cn
+          is_cn_present = !is.null(paths_cn_field)
+          list_of_cn = list(mincn = NA_real_, maxcn = NA_real_)
+          if (is_cn_present) {
+            list_of_cn = paths$eval(
+              edge = {
+                alt_edge_cn = cn[type == "ALT"]
+                min_val = NA_real_
+                max_val = NA_real_
+                if (length(alt_edge_cn) > 0) {
+                  min_val = min(alt_edge_cn, na.rm = TRUE)
+                  max_val = max(alt_edge_cn, na.rm = TRUE)
+                }
+                ## Seems like lazyeval makes you do
+                ## stuff like this to get a list back
+                list(list(list(mincn = min_val, maxcn = max_val)))
               }
-              ## Seems like lazyeval makes you do
-              ## stuff like this to get a list back
-              list(list(list(mincn = min_val, maxcn = max_val)))
+            ) 
+            list_of_cn = gGnome::transpose(list_of_cn)
+            for (i in seq_along(list_of_cn)) {
+              list_of_cn[[i]] = unlist(list_of_cn[[i]])
             }
-          ) 
-          list_of_cn = gGnome::transpose(list_of_cn)
-          for (i in seq_along(list_of_cn)) {
-            list_of_cn[[i]] = unlist(list_of_cn[[i]])
           }
           numchr = paths$eval(node = length(unique(seqnames)))
           numab = paths$eval(edge = sum(type == 'ALT'))
@@ -1431,25 +1521,29 @@ get_txloops = function(tgg,
       ## ab.l = ab.l[!duplicated(sapply(ab.l$snode.id, paste, collapse = ', '))]
       is_duplicated = duplicated(sapply(ab.l$snode.id, paste, collapse = ', '))
 
-      list_of_cn = ab.l$eval(
-        edge = {
-          alt_edge_cn = cn[type == "ALT"]
-          min_val = NA_real_
-          max_val = NA_real_
-          if (length(alt_edge_cn) > 0) {
-            min_val = min(alt_edge_cn, na.rm = TRUE)
-            max_val = max(alt_edge_cn, na.rm = TRUE)
+      paths_cn_field = ab.l$edges$dt$cn
+      is_cn_present = !is.null(paths_cn_field)
+      list_of_cn = list(mincn = NA_real_, maxcn = NA_real_)
+      if (is_cn_present) {
+        list_of_cn = ab.l$eval(
+          edge = {
+            alt_edge_cn = cn[type == "ALT"]
+            min_val = NA_real_
+            max_val = NA_real_
+            if (length(alt_edge_cn) > 0) {
+              min_val = min(alt_edge_cn, na.rm = TRUE)
+              max_val = max(alt_edge_cn, na.rm = TRUE)
+            }
+            ## Seems like lazyeval makes you do
+            ## stuff like this to get a list back
+            list(list(list(mincn = min_val, maxcn = max_val)))
           }
-          ## Seems like lazyeval makes you do
-          ## stuff like this to get a list back
-          list(list(list(mincn = min_val, maxcn = max_val)))
+        ) 
+        list_of_cn = gGnome::transpose(list_of_cn)
+        for (i in seq_along(list_of_cn)) {
+          list_of_cn[[i]] = unlist(list_of_cn[[i]])
         }
-      ) 
-      list_of_cn = gGnome::transpose(list_of_cn)
-      for (i in seq_along(list_of_cn)) {
-        list_of_cn[[i]] = unlist(list_of_cn[[i]])
-      }      
-
+      }
       numchr = ab.l$eval(node = length(unique(seqnames)))
       numab = ab.l$eval(edge = sum(type == 'ALT'))
       numgenes = ab.l$eval(node = length(unique(gene_name[!is.na(gene_name)])))
@@ -3846,4 +3940,207 @@ events.to.gr = function(gg){
     mcols(ggrl) = gg$meta$events
     ggr = grl.unlist(ggrl)
     return(ggr)
+}
+
+
+
+get_nearest_reciprocal_breakend = function(junctions, dist_thresh = 100000, are_bp_indices_parallel = TRUE) {
+    is_jun_duplicated = gGnome::fra.duplicated(junctions, pad = 1000)
+    if (any(is_jun_duplicated)) stop("junctions must be deduplicated")
+    junctions_dedup_unl = grl.unlist(junctions)
+    convert_dt = function(x) setDT(as.data.frame(x))
+    fov = findOverlaps(
+        junctions_dedup_unl + dist_thresh,
+        gr.flipstrand(junctions_dedup_unl) + dist_thresh, ignore.strand = FALSE) %>% convert_dt()
+    if (are_bp_indices_parallel) 
+        fov = fov[queryHits != subjectHits]
+    fov$query_grl.ix = mcols(junctions_dedup_unl)[fov$queryHits,"grl.ix"]
+    fov$subject_grl.ix = mcols(junctions_dedup_unl)[fov$subjectHits,"grl.ix"]
+    fov$query_grl.iix = mcols(junctions_dedup_unl)[fov$queryHits,"grl.iix"]
+    fov$subject_grl.iix = mcols(junctions_dedup_unl)[fov$subjectHits,"grl.iix"]
+    fov$query_strand = as.character(strand(junctions_dedup_unl)[fov$queryHits])
+    fov$subject_strand = as.character(strand(junctions_dedup_unl)[fov$subjectHits])
+    fov = fov[query_grl.ix != subject_grl.ix,]
+    fov = fov[queryHits < subjectHits]
+    fov$dist = gGnome:::pdist(junctions_dedup_unl[fov$queryHits], gr.flipstrand(junctions_dedup_unl)[fov$subjectHits])
+    
+    ig = igraph::make_empty_graph(NROW(junctions_dedup_unl), directed = FALSE)
+    edges_to_add = unlist(purrr::transpose(fov[, .(queryHits, subjectHits)]))
+    ig = igraph::add_edges(ig, edges_to_add)
+    clusters = igraph::components(ig,mode = "weak")
+
+    fov$query_cluster = clusters$membership[fov$queryHits]
+    fov$subject_cluster = clusters$membership[fov$subjectHits]
+
+    fov_qdedup = fov[order(dist)][!duplicated(queryHits)]
+    fov_qdedup[, is_min_dist := !gGnome::duplicated_tuples(queryHits, subjectHits)][]
+
+    fov_qdedup[, is_min_dist := !gGnome::duplicated_tuples(queryHits, subjectHits), by = query_cluster]
+    
+    return(fov_qdedup
+           [is_min_dist == TRUE]
+           [dist < dist_thresh]
+           )
+}
+
+get_all_possible_reciprocal_pairs = function(junctions, dist_thresh = 100000, are_bp_indices_parallel = TRUE) {
+    is_jun_duplicated = gGnome::fra.duplicated(junctions, pad = 1000)
+    if (any(is_jun_duplicated)) stop("junctions must be deduplicated")
+    junctions_dedup_unl = grl.unlist(junctions)
+    convert_dt = function(x) setDT(as.data.frame(x))
+    fov = findOverlaps(
+        junctions_dedup_unl + dist_thresh,
+        gr.flipstrand(junctions_dedup_unl) + dist_thresh, ignore.strand = FALSE) %>% convert_dt()
+    if (are_bp_indices_parallel) 
+        fov = fov[queryHits != subjectHits]
+    fov$query_grl.ix = mcols(junctions_dedup_unl)[fov$queryHits,"grl.ix"]
+    fov$subject_grl.ix = mcols(junctions_dedup_unl)[fov$subjectHits,"grl.ix"]
+    fov$query_grl.iix = mcols(junctions_dedup_unl)[fov$queryHits,"grl.iix"]
+    fov$subject_grl.iix = mcols(junctions_dedup_unl)[fov$subjectHits,"grl.iix"]
+    fov$query_strand = as.character(strand(junctions_dedup_unl)[fov$queryHits])
+    fov$subject_strand = as.character(strand(junctions_dedup_unl)[fov$subjectHits])
+    fov = fov[query_grl.ix != subject_grl.ix,]
+    fov = fov[queryHits < subjectHits]
+    fov$dist = gGnome:::pdist(junctions_dedup_unl[fov$queryHits], gr.flipstrand(junctions_dedup_unl)[fov$subjectHits])
+    
+    ## ixiix_map = fov_qdedup = fov[order(dist)][!duplicated(queryHits)]
+
+    ## ixiix_map = gGnome::copy(fov_qdedup)
+    ixiix_map = gGnome::copy(fov)
+
+    ixiix_map = data.table::setkey(
+      ixiix_map,
+      query_grl.ix,
+      query_grl.iix
+    )[]
+
+    query_grl.ix1 = (
+      ixiix_map
+      [list(unique(fov$query_grl.ix), 1)]
+    )
+
+
+    query_grl.ix2 = (
+      ixiix_map
+      [list(unique(fov$query_grl.ix), 2)]
+    )
+
+    reciprocal_hits = merge(query_grl.ix1, query_grl.ix2, by = c("query_grl.ix", "subject_grl.ix"))[subject_grl.iix.x != subject_grl.iix.y]
+    
+    return(reciprocal_hits)
+    
+    ## is_query_parallel = (
+    ##   identical(NROW(query_grl.ix1), NROW(query_grl.ix2))
+    ##   && all(query_grl.ix1$query_grl.ix == query_grl.ix2$query_grl.ix)
+    ## )
+
+    ## pairmatches = which(query_grl.ix1$subject_grl.ix == query_grl.ix2$subject_grl.ix)
+
+    ## is_query_in_agreement = all(query_grl.ix1[pairmatches,]$query_grl.ix == query_grl.ix2[pairmatches,]$query_grl.ix)
+    ## is_subject_in_agreement = all(query_grl.ix1[pairmatches,]$subject_grl.ix == query_grl.ix2[pairmatches,]$subject_grl.ix)
+
+    ## if (!is_query_in_agreement || !is_subject_in_agreement) message("something's amiss")
+    
+    
+    ## reciprocal_pairmatches = which(query_grl.ix1[pairmatches,]$subject_grl.iix != query_grl.ix2[pairmatches,]$subject_grl.iix)
+
+    ## reciprocal_ix = pairmatches[reciprocal_pairmatches]
+        
+    ## return(reciprocal_hits = query_grl.ix1[reciprocal_ix])
+}
+
+
+
+#' get_reciprocal_pairs
+#' 
+#' Get all reciprocal pairs from set of junctions
+#' 
+#' Match junction within 1e5
+#' @param max_dist Maximum distance between breakends of reciprocal pairs
+#' @param distance_pad Max distance of query (breakends larger than this are not considered, limits compute)
+#' @export 
+get_reciprocal_pairs = function(jun, max_dist = 1e3, distance_pad = 1e5, nearest_only = FALSE) {
+    is_grangeslist = inherits(jun, "GRangesList")
+    is_junction_r6 = inherits(jun, "Junction")
+    is_ggraph = inherits(jun, "gGraph")
+    is_gedge = inherits(jun, "gEdge")
+    is_invalid = !(is_grangeslist || is_junction_r6 || is_ggraph || is_gedge)
+    if (is_invalid) {
+        stop("Input must be a GRangesList, Junction, gGraph or gEdge")
+    }
+    if (is_junction_r6) jun = jun$grl
+    if (is_ggraph) jun = jun$edges[type == "ALT"]$grl
+    if (is_gedge) jun = jun[type == "ALT"]$grl
+    nr = NROW(jun)
+    enr = S4Vectors::elementNROWS(jun)
+    is_empty = nr == 0
+    # is_every_item_length2 = !is_empty && all(enr == 2)
+    empty_grl = GRangesList()
+    empty_grl = gUtils::gr.fix(empty_grl, jun)
+    if (is_empty) return(empty_grl)
+    
+    jun = gGnome:::normalize_junctions(jun)
+
+    rangelist = range(jun, ignore.strand = TRUE)
+    wd = width(rangelist)
+    wd[base::lengths(rangelist) > 1] = IntegerList(NA_integer_)
+    mcols(jun)$intrachromosomal_width = unlist(wd)
+
+
+    is_jun_duplicated = gGnome::fra.duplicated(jun, pad = max_dist)
+
+    jun_dedup = jun[!is_jun_duplicated]
+
+    junwid = mcols(jun_dedup)$intrachromosomal_width
+    jun_dedup = jun_dedup[ifelse(is.na(junwid), Inf, junwid) >= max_dist]
+    nr = NROW(jun_dedup)
+    is_empty = nr == 0
+    if (is_empty) {
+      return(empty_grl)
+    }
+    jun_dedup_unlist = gUtils::grl.unlist(jun_dedup)
+
+    if (nearest_only) {
+        pairings = gGnome:::get_nearest_reciprocal_breakend(jun_dedup, dist_thresh = distance_pad)
+        jun_dedup_unlist = gUtils::grl.unlist(jun_dedup)
+
+        pairings = pairings[dist <= 1e6]
+
+        pairings[, keyid := ifelse(
+                query_grl.ix < subject_grl.ix, 
+                paste(query_grl.ix, subject_grl.ix), 
+                paste(subject_grl.ix, query_grl.ix)
+        )]
+        
+        pairings[, junpair_occurrences := .N, by = keyid]
+
+        pairings$query_filter = jun_dedup_unlist$FILTER[pairings_1kb$queryHits]
+        pairings$subject_filter = jun_dedup_unlist$FILTER[pairings_1kb$subjectHits]
+
+        recip_pairs_to_rescue = (
+            pairings_1kb
+            [junpair_occurrences == 2]
+        )
+
+        recip_pairs_to_rescue[, cluster_id := .GRP, by = keyid]
+
+        rescue_ix = recip_pairs_to_rescue[, unique(c(query_grl.ix, subject_grl.ix))]
+
+        map_jun = recip_pairs_to_rescue[, .(grl.ix = c(query_grl.ix, subject_grl.ix), cluster_id = c(cluster_id, cluster_id))]
+
+        mcols(jun_dedup)$cluster_id = NA_integer_
+        mcols(jun_dedup)[map_jun$grl.ix,"cluster_id"] = map_jun$cluster_id
+
+        jun_filt_rescue = jun_dedup[rescue_ix]
+    } else {
+        recip_pairs_to_rescue = pairings = gGnome:::get_all_possible_reciprocal_pairs(jun_dedup, dist_thresh = distance_pad)
+
+        rescue_ix = recip_pairs_to_rescue[, unique(c(query_grl.ix, subject_grl.ix))]
+        rescue_ix = sort(rescue_ix)
+
+        jun_filt_rescue = jun_dedup[rescue_ix]
+    }
+
+    return(jun_filt_rescue)
+
 }

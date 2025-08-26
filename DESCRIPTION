@@ -35,6 +35,7 @@ Depends:
     MatrixGenerics,
     igraph
 Imports:
+    Rcpp,
     reshape2,
     gTrack,
     methods,

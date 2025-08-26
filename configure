@@ -1,20 +1,25 @@
 #!/bin/sh
 
-echo "configure working dir:"
-echo $(pwd)
+printf "configure working dir:\n%s\n" $(pwd)
 rm -rf src
+mkdir -p src
 
-system=`uname`
+system=$(uname)
 
-if [ -z "${CPLEX_DIR}" ]
-then
-    echo "CPLEX_DIR environment variable not set, please set (e.g. ~/Path/To/CPLEX_Studio/) prior to installing in order to install gGnome with CPLEX functionality"
-    cp -r srcs/src.blank src
-elif [ ! -d "${CPLEX_DIR}" ]
-then
-    echo "CPLEX_DIR variable set but directory $CPLEX_DIR not found, please set to a valid absolute path (e.g. /Path/To/CPLEX_Studio/) in order to install gGnome with CPLEX functionality"
-    cp -r srcs/src.blank src
+is_cplex_var_absent=$( [ -z "${CPLEX_DIR}" ] && echo true || echo false )
+is_cplex_dir_absent=$( (! $is_cplex_var_absent && [ ! -d "${CPLEX_DIR}" ] ) && echo true || echo false )
+is_cplex_not_present=$( ($is_cplex_dir_absent || $is_cplex_var_absent) && echo true || echo false )
+
+if $is_cplex_not_present; then
+    $is_cplex_var_absent && echo "CPLEX_DIR environment variable not set, please set (e.g. ~/Path/To/CPLEX_Studio/) prior to installing in order to install gGnome with CPLEX functionality"
+    $is_cplex_dir_absent && echo "CPLEX_DIR: ${CPLEX_DIR} not found!"
+    cp -r srcs/src.blank/* src/
+    rm -f src/Rcplex_utils*
+    rm -f src/Rcplex_params*
 else
     echo "CPLEX_DIR environment variable, found (CPLEX_DIR=$CPLEX_DIR), will install CPLEX functionality"
-    cp -r srcs/src.rcplex src
+    cp -r srcs/src.rcplex/* src/
 fi
+
+# cp srcs/src.c/* src
+
