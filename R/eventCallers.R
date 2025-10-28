@@ -4175,3 +4175,216 @@ get_reciprocal_pairs = function(jun, max_dist = 1e3, distance_pad = 1e5, nearest
     return(jun_filt_rescue)
 
 }
+
+
+
+#' Low level Amplifications
+#' @name low_amp
+#' @description
+#' Classifies low-level amplifications in copy number annotated gGraph. In development with parameters. 
+#' 
+#' @param gg gGraph
+#' @param jcn.thresh minimal ALT edge junction threshold to classify a high copy cluster. 
+#' Default: 9
+#' @param cn.thresh minimal node copy number in ploidy units to classify a high copy cluster.
+#' Default: 2
+#' @param fbi.cn.thresh fraction of total CN in cluster that is contributed to by 
+#' fold back inversions, if higher than this will call a BFB.
+#' Default: 0.5
+#' @param n.jun.high.bfb.thresh max number of high copy junctions in a fbi.cn 
+#' high cluster, if fbi.cn is high and high copy junctions exceed this, then will call a tyfonas.
+#' Default: 26
+#' @param n.jun.high.dm.thresh double minute threshold set for junctions. If fbi.cn 
+#' is low, and high copy junctions exceed this thresh, it will call it cpxdm, else
+#' dm.
+#' Default: 31
+#' @param width.thresh minimum width to consider for an amplification event. 
+#' Default: 1e5
+#' @param mark.nos (logical) Default: FALSE
+#' @param min.nodes (numeric) minimum number of nodes for a cluster to be 
+#' designated amp-NOS. Default: 3
+#' @param min.jun (numeric) minimum number of aberrant junctions for a cluster 
+#' to be designated amp-NOS. Default: 2
+#' @param add_to_events (logical) Default: False. Whether to add these amps to $meta$events or only $meta$low_amp
+#' @details Amplification events are defined into 3 groups, bfb, tyfonas, and dm events.
+#' More details can be found in the tutorial:
+#' \href{http://mskilab.com/gGnome/tutorial.html#Complex_amplicons_(bfb,_dm,_tyfonas)}{Complex Amplicons}
+#' 
+#' @return gg of amplification events found.
+#' @md
+#' @export
+low_amp = function(gg,
+                   jcn.thresh = 2, #changed from 8 in amp function
+                   cn.thresh = 1,  #changed from 2 in amp function 
+                   fbi.cn.thresh = 0.5,  
+               n.jun.high.bfb.thresh = 26, n.jun.high.dm.thresh = 31, width.thresh = 1e5, 
+               fbi.width.thresh = 1e5, mc.cores = 1, mark = TRUE, mark.col = 'purple', 
+               mark.nos = FALSE, min.nodes = 3, min.jun = 2, add_to_events = FALSE)
+{
+    if (mark.nos) {
+        gg$nodes$mark(nos = as.integer(NA))
+        gg$edges$mark(nos = as.integer(NA))
+    }
+
+    gg$nodes$mark(cpxdm_low = as.integer(NA))
+    gg$edges$mark(cpxdm_low = as.integer(NA))
+    gg$nodes$mark(tyfonas_low = as.integer(NA))
+    gg$edges$mark(tyfonas_low = as.integer(NA))
+    gg$nodes$mark(dm_low = as.integer(NA))
+    gg$edges$mark(dm_low = as.integer(NA))
+    gg$nodes$mark(bfb_low = as.integer(NA))
+    gg$edges$mark(bfb_low = as.integer(NA))
+    ## browser()
+    ## gg$edges$mark(fbi = gg$edges$class == 'INV-like' & gg$edges$span < fbi.width.thresh)
+    gg$set(low_amp = data.table())
+    ploidy = gg$nodes$dt[!is.na(cn), sum(cn*as.numeric(width))/sum(as.numeric(width))]
+    keep = (gg$nodes$dt$cn/ploidy) > cn.thresh
+    gg$clusters(keep)
+    if (!any(!is.na(gg$nodes$dt$cluster)))
+        return(gg)
+
+  tiny = gg$edges$mark(tiny = gg$edges$dt$class %in% c('DEL-like', 'DUP-like') & gg$edges$span <1e4)
+  ucl = gg$nodes$dt[!is.na(cluster), .(wid = sum(width)), by = cluster][wid > width.thresh, cluster] %>% sort
+
+  amps = mclapply(ucl, function(cl, ploidy) {
+    cl.nodes = gg$nodes[cluster == cl]
+    cl.edges = cl.nodes$edges[type == "ALT" & tiny == FALSE]
+    if (!length(cl.edges)) 
+      return(NULL)
+    if (!length(cl.edges)) 
+      return(NULL)
+    data.table(cluster = cl,
+               nodes = paste(cl.nodes$dt$node.id,
+                             collapse = ","),
+               edges = paste(cl.edges$dt$edge.id, 
+                             collapse = ","),
+               fbi.cn = 2 * sum(cl.edges$dt[fbi == TRUE, sum(cn)]),
+               n.jun = length(cl.edges),
+               n.jun.high = sum(cl.edges$dt[, sum(cn > 3)]), 
+               max.jcn = max(c(0, cl.edges$dt$cn)),
+               max.cn = max(cl.nodes$dt$cn),
+               footprint = paste(gr.string(cl.nodes$footprint),
+                                 collapse = ","))
+  }, ploidy, mc.cores = mc.cores) %>% rbindlist
+
+  if (nrow(amps))
+  {
+      if (!mark.nos) {
+          amps = amps[max.jcn >= jcn.thresh,]
+          ##amps[max.jcn >= jcn.thresh, ]
+      } else {
+          ## keep only clusters with a sufficient number of nodes but don't filter by jcn
+          amps = amps[max.jcn >= jcn.thresh | 
+                      (n.jun >= min.jun &
+                       (strsplit(nodes, ",") %>% lapply(length) %>% unlist) >= min.nodes),]
+      }
+  }
+
+  ## implementing decision tree in https://tinyurl.com/srlbkh2
+  if (nrow(amps))
+  {
+      ## order / rename and mark
+      gg$set(amp_low = amps)
+
+      ## call and mark event types
+      amps[, type := ifelse(
+                 max.jcn < jcn.thresh,
+                 "nos",
+                     ifelse(
+                         ## few high copy junctions, high fbi cn -> BFB, otherwise tyfonas
+                         fbi.cn / max.cn >= fbi.cn.thresh,
+                     ifelse(n.jun.high < n.jun.high.bfb.thresh, 
+                            'bfb_low',
+                            'tyfonas_low'),
+                     ## few high copy junctions, low fbi cn -> DM, otherwise CPXDM
+                     ifelse(n.jun.high >= n.jun.high.dm.thresh, 
+                            'cpxdm_low',     
+                            'dm_low')
+                     )
+             )]
+      
+      amps[, ev.id := 1:.N, by = type]
+
+      ## unlist node and edge ids and map back to type and ev label
+      nodelist = strsplit(amps$nodes, ',') %>% lapply(as.integer) %>% dunlist
+      edgelist = strsplit(amps$edges, ',') %>% lapply(as.integer) %>% dunlist
+      nodelist = cbind(nodelist, amps[nodelist$listid, .(type, ev.id)])
+      edgelist = cbind(edgelist, amps[edgelist$listid, .(type, ev.id)])
+    
+      nodelist[, {
+          if (type == 'dm_low')
+          {
+              gg$nodes[V1]$mark(dm_low = ev.id)
+          }
+          else if (type == 'tyfonas_low')
+          {
+              gg$nodes[V1]$mark(tyfonas_low = ev.id)
+          }
+          else if (type == 'cpxdm_low')
+          {
+              gg$nodes[V1]$mark(cpxdm_low = ev.id)
+          }
+          else if (type == "bfb_low")
+          {
+              gg$nodes[V1]$mark(bfb_low = ev.id)
+          }
+          else
+          {
+              gg$nodes[V1]$mark(nos_low = ev.id)
+          }
+      }, by = type]
+      
+      edgelist[, {
+          if (type == 'dm_low')
+          {
+              gg$edges[V1]$mark(dm_low = ev.id)
+          }
+          else if (type == 'tyfonas_low')
+          {
+              gg$edges[V1]$mark(tyfonas_low = ev.id)
+          }
+          else if (type == 'cpxdm_low')
+          {
+              gg$edges[V1]$mark(cpxdm_low = ev.id)
+          }
+          else if (type == 'bfb_low')
+          {
+              gg$edges[V1]$mark(bfb_low = ev.id)
+          }
+          else
+          {
+              gg$edges[V1]$mark(nos_low = ev.id)
+          }
+      }, by = type]
+          
+      if (mark)
+      {
+          gg$nodes[!is.na(tyfonas_low)]$mark(col = mark.col)
+          gg$edges[!is.na(tyfonas_low)]$mark(col = mark.col)
+          
+          gg$nodes[!is.na(dm_low)]$mark(col = mark.col)
+          gg$edges[!is.na(dm_low)]$mark(col = mark.col)
+
+          gg$nodes[!is.na(bfb_low)]$mark(col = mark.col)
+          gg$edges[!is.na(bfb_low)]$mark(col = mark.col)
+
+          gg$nodes[!is.na(cpxdm_low)]$mark(col = mark.col)
+          gg$edges[!is.na(cpxdm_low)]$mark(col = mark.col)
+
+          if (mark.nos) {
+              gg$nodes[!is.na(nos_low)]$mark(col = mark.col)
+              gg$edges[!is.na(nos_low)]$mark(col = mark.col)
+          }
+      }
+    if(add_to_events) {
+      ## current events
+      ev = gg$meta$events
+      ## add the amps
+      ev = rbind(ev, amps, fill = TRUE)
+      gg$set(events = ev)
+    }
+  }
+
+    
+  return(gg)
+}
